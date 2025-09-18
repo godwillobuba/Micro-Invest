@@ -14,9 +14,16 @@
 (define-constant ERR-DEADLINE-PASSED (err u108))
 (define-constant ERR-DEADLINE-NOT-REACHED (err u109))
 (define-constant ERR-ZERO-AMOUNT (err u110))
+(define-constant ERR-INVALID-INPUT (err u111))
+(define-constant ERR-INVALID-PROJECT-ID (err u112))
 
 ;; Platform fee percentage (in basis points, e.g., 250 = 2.5%)
 (define-constant PLATFORM-FEE u250)
+
+;; Input validation constants
+(define-constant MAX-PROJECT-ID u1000000)
+(define-constant MIN-TITLE-LENGTH u1)
+(define-constant MIN-DESCRIPTION-LENGTH u10)
 
 ;; DATA VARIABLES
 (define-data-var next-project-id uint u1)
@@ -76,6 +83,32 @@
   uint
 )
 
+;; VALIDATION HELPER FUNCTIONS
+
+;; Validate string is not empty and within bounds
+(define-private (is-valid-string (input (string-ascii 500)) (min-len uint))
+  (and 
+    (>= (len input) min-len)
+    (> (len input) u0)
+  )
+)
+
+;; Validate project ID is within reasonable bounds
+(define-private (is-valid-project-id (project-id uint))
+  (and 
+    (> project-id u0)
+    (<= project-id MAX-PROJECT-ID)
+  )
+)
+
+;; Validate project exists and get it safely
+(define-private (get-validated-project (project-id uint))
+  (begin
+    (asserts! (is-valid-project-id project-id) ERR-INVALID-PROJECT-ID)
+    (ok (unwrap! (map-get? projects project-id) ERR-NOT-FOUND))
+  )
+)
+
 ;; READ-ONLY FUNCTIONS
 
 ;; Get user profile
@@ -91,14 +124,20 @@
   )
 )
 
-;; Get project details
+;; Get project details with validation
 (define-read-only (get-project (project-id uint))
-  (map-get? projects project-id)
+  (if (is-valid-project-id project-id)
+    (map-get? projects project-id)
+    none
+  )
 )
 
 ;; Get investment details
 (define-read-only (get-investment (investor principal) (project-id uint))
-  (map-get? investments {investor: investor, project-id: project-id})
+  (if (is-valid-project-id project-id)
+    (map-get? investments {investor: investor, project-id: project-id})
+    none
+  )
 )
 
 ;; Get platform treasury balance
@@ -113,7 +152,7 @@
 
 ;; Check if project funding goal is reached
 (define-read-only (is-project-funded (project-id uint))
-  (match (map-get? projects project-id)
+  (match (get-project project-id)
     project (>= (get current-funding project) (get funding-goal project))
     false
   )
@@ -121,7 +160,7 @@
 
 ;; Calculate potential returns for an investment
 (define-read-only (calculate-returns (project-id uint) (investment-amount uint))
-  (match (map-get? projects project-id)
+  (match (get-project project-id)
     project 
       (let 
         (
@@ -136,12 +175,18 @@
 
 ;; Get investor at specific index for a project
 (define-read-only (get-project-investor (project-id uint) (investor-index uint))
-  (map-get? project-investors {project-id: project-id, investor-index: investor-index})
+  (if (is-valid-project-id project-id)
+    (map-get? project-investors {project-id: project-id, investor-index: investor-index})
+    none
+  )
 )
 
 ;; Get total number of investors for a project
 (define-read-only (get-investor-count (project-id uint))
-  (default-to u0 (map-get? investor-counts project-id))
+  (if (is-valid-project-id project-id)
+    (default-to u0 (map-get? investor-counts project-id))
+    u0
+  )
 )
 
 ;; PUBLIC FUNCTIONS
@@ -158,7 +203,7 @@
   )
 )
 
-;; Create a new investment project
+;; Create a new investment project with enhanced validation
 (define-public (create-project 
   (title (string-ascii 100))
   (description (string-ascii 500))
@@ -172,12 +217,16 @@
       (project-id (var-get next-project-id))
       (current-user (get-user tx-sender))
     )
+    ;; Enhanced input validation
+    (asserts! (is-valid-string title MIN-TITLE-LENGTH) ERR-INVALID-INPUT)
+    (asserts! (is-valid-string description MIN-DESCRIPTION-LENGTH) ERR-INVALID-INPUT)
     (asserts! (> funding-goal u0) ERR-INVALID-AMOUNT)
     (asserts! (> deadline block-height) ERR-DEADLINE-PASSED)
     (asserts! (> min-investment u0) ERR-ZERO-AMOUNT)
     (asserts! (<= expected-return-rate u10000) ERR-INVALID-AMOUNT) ;; Max 100% return
+    (asserts! (< project-id MAX-PROJECT-ID) ERR-INVALID-PROJECT-ID)
     
-    ;; Create project
+    ;; Create project with validated inputs
     (map-set projects project-id
       {
         creator: tx-sender,
@@ -217,7 +266,7 @@
 (define-public (invest-in-project (project-id uint) (amount uint))
   (let 
     (
-      (project (unwrap! (map-get? projects project-id) ERR-NOT-FOUND))
+      (project (try! (get-validated-project project-id)))
       (existing-investment (map-get? investments {investor: tx-sender, project-id: project-id}))
       (current-user (get-user tx-sender))
       (platform-fee-amount (/ (* amount PLATFORM-FEE) u10000))
@@ -295,7 +344,7 @@
 (define-public (close-project (project-id uint))
   (let 
     (
-      (project (unwrap! (map-get? projects project-id) ERR-NOT-FOUND))
+      (project (try! (get-validated-project project-id)))
       (withdrawal-amount (get current-funding project))
     )
     (asserts! (is-eq tx-sender (get creator project)) ERR-NOT-AUTHORIZED)
@@ -318,7 +367,7 @@
 (define-public (distribute-returns (project-id uint))
   (let 
     (
-      (project (unwrap! (map-get? projects project-id) ERR-NOT-FOUND))
+      (project (try! (get-validated-project project-id)))
     )
     (asserts! (is-eq tx-sender (get creator project)) ERR-NOT-AUTHORIZED)
     (asserts! (not (get is-active project)) ERR-PROJECT-CLOSED)
@@ -337,7 +386,7 @@
 (define-public (claim-returns (project-id uint))
   (let 
     (
-      (project (unwrap! (map-get? projects project-id) ERR-NOT-FOUND))
+      (project (try! (get-validated-project project-id)))
       (investment (unwrap! (map-get? investments {investor: tx-sender, project-id: project-id}) ERR-NOT-FOUND))
       (returns-amount (unwrap! (calculate-returns project-id (get amount investment)) ERR-INVALID-AMOUNT))
     )
@@ -360,7 +409,7 @@
 (define-public (refund-investment (project-id uint))
   (let 
     (
-      (project (unwrap! (map-get? projects project-id) ERR-NOT-FOUND))
+      (project (try! (get-validated-project project-id)))
       (investment (unwrap! (map-get? investments {investor: tx-sender, project-id: project-id}) ERR-NOT-FOUND))
       (refund-amount (get amount investment))
     )
@@ -390,6 +439,7 @@
   (begin
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
     (asserts! (<= amount (var-get platform-treasury)) ERR-INSUFFICIENT-FUNDS)
+    (asserts! (> amount u0) ERR-ZERO-AMOUNT)
     
     ;; Transfer fees to contract owner
     (try! (as-contract (stx-transfer? amount tx-sender CONTRACT-OWNER)))
@@ -401,13 +451,14 @@
   )
 )
 
-;; Emergency pause function (only contract owner)
+;; Emergency pause function (only contract owner) with enhanced validation
 (define-public (emergency-pause-project (project-id uint))
   (let 
     (
-      (project (unwrap! (map-get? projects project-id) ERR-NOT-FOUND))
+      (project (try! (get-validated-project project-id)))
     )
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (get is-active project) ERR-PROJECT-CLOSED)
     
     (map-set projects project-id
       (merge project {is-active: false})
